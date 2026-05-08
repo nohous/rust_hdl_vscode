@@ -18,6 +18,10 @@ const config = {
     devtool: 'source-map',
     externals: {
         vscode: 'commonjs vscode', // the vscode-module is created on-the-fly and must be excluded. Add other modules that cannot be webpack'ed, 📖 -> https://webpack.js.org/configuration/externals/
+        // Optional native dependency of elkjs/netlistsvg used for
+        // multi-threaded layout. Not installed; ELK falls back to a
+        // synchronous in-process layout if this require throws.
+        'webworker-threads': 'commonjs webworker-threads',
     },
     resolve: {
         alias: {
@@ -47,6 +51,12 @@ const config = {
                         },
                     },
                 ],
+            },
+            {
+                // Inline netlistsvg's skin SVG into the bundle as a
+                // string so we don't need to ship node_modules.
+                test: /netlistsvg[\\/]lib[\\/].*\.svg$/,
+                type: 'asset/source',
             },
         ],
     },

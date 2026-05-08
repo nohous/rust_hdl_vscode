@@ -153,8 +153,34 @@
 				"title": "Set Hierarchy Top Entity...",
 				"category": "VHDL LS",
 				"icon": "$(edit)"
+			},
+			{
+				"command": "vhdlls.showDataflow",
+				"title": "Show Data Flow Schematic...",
+				"category": "VHDL LS",
+				"icon": "$(circuit-board)"
+			},
+			{
+				"command": "vhdlls.showDataflowFromHierarchy",
+				"title": "Show Data Flow Schematic Here",
+				"category": "VHDL LS",
+				"icon": "$(circuit-board)"
 			}
 		],
+		"menus": {
+			"view/item/context": [
+				{
+					"command": "vhdlls.showDataflowFromHierarchy",
+					"when": "view == vhdlHierarchy && (viewItem == top || viewItem == entity || viewItem == boundComponent)",
+					"group": "inline"
+				},
+				{
+					"command": "vhdlls.showDataflowFromHierarchy",
+					"when": "view == vhdlHierarchy && (viewItem == top || viewItem == entity || viewItem == boundComponent)",
+					"group": "navigation"
+				}
+			]
+		},
 		"viewsContainers": {
 			"activitybar": [
 				{

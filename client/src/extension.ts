@@ -41,6 +41,8 @@ import {
     ServerOptions,
 } from 'vscode-languageclient/node';
 
+import { DataFlowPanel } from './dataflow';
+
 let client: LanguageClient;
 
 enum LanguageServerBinary {
@@ -186,6 +188,50 @@ export async function activate(ctx: ExtensionContext) {
         commands.registerCommand('vhdlls.refreshHierarchy', () => {
             hierarchyProvider.refresh();
         })
+    );
+
+    // Data-flow schematic command. Reuses the same picker as the
+    // hierarchy view, then opens (or refreshes) a webview panel.
+    ctx.subscriptions.push(
+        commands.registerCommand('vhdlls.showDataflow', async () => {
+            const top = await pickTopEntity(() => client, output);
+            if (!top) {
+                return;
+            }
+            DataFlowPanel.showOrCreate(
+                top.library,
+                top.entity,
+                () => client,
+                output
+            );
+        })
+    );
+
+    // Same command, but invoked from the hierarchy tree-view context
+    // menu. The tree element is passed as the first argument.
+    ctx.subscriptions.push(
+        commands.registerCommand(
+            'vhdlls.showDataflowFromHierarchy',
+            (element: unknown) => {
+                const node = extractHierarchyNode(element);
+                if (!node) {
+                    return;
+                }
+                const top = parseTopEntity(node.entity);
+                if (!top) {
+                    output.appendLine(
+                        `Could not parse entity path: ${node.entity}`
+                    );
+                    return;
+                }
+                DataFlowPanel.showOrCreate(
+                    top.library,
+                    top.entity,
+                    () => client,
+                    output
+                );
+            }
+        )
     );
 
     // If a default top entity is configured, load the hierarchy on startup.
@@ -551,6 +597,26 @@ async function persistTopEntity(
     } catch (err) {
         log.appendLine(`Could not persist vhdlls.topEntity: ${err}`);
     }
+}
+
+function extractHierarchyNode(
+    element: unknown
+): HierarchyResponseNode | undefined {
+    if (
+        typeof element === 'object' &&
+        element !== null &&
+        (element as { kind?: unknown }).kind === 'node'
+    ) {
+        const e = element as { node?: unknown };
+        if (
+            typeof e.node === 'object' &&
+            e.node !== null &&
+            typeof (e.node as { entity?: unknown }).entity === 'string'
+        ) {
+            return e.node as HierarchyResponseNode;
+        }
+    }
+    return undefined;
 }
 
 function parseTopEntity(input: string): TopEntity | undefined {
