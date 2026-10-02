@@ -1,0 +1,14 @@
+{
+	"compilerOptions": {
+		"module": "es2020",
+		"moduleResolution": "node",
+		"target": "es2020",
+		"lib": ["es2020", "dom", "dom.iterable"],
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"noEmit": false,
+		"sourceMap": true
+	},
+	"include": ["."]
+}

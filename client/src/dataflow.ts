@@ -14,185 +14,70 @@ import {
 } from 'vscode';
 import { LanguageClient } from 'vscode-languageclient/node';
 
-// netlistsvg is a Node-side renderer. We invoke it in the extension
-// process (not in the webview) so we don't have to bundle ELK as
-// browser code; the resulting SVG is plain markup the webview can
-// just inject.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const netlistsvg: {
-    render: (
-        skin: string,
-        netlist: unknown,
-        done: (err: unknown, svg: string) => void
-    ) => void;
-} = require('netlistsvg');
-
-// Webpack rule (`type: 'asset/source'`) inlines the skin XML as a
-// string. Avoids shipping node_modules.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const defaultSkin: string = require('netlistsvg/lib/default.svg');
-
 export const DATA_FLOW_REQUEST = 'vhdl/dataFlow';
 
-export interface DataFlowParams {
-    library: string;
-    entity: string;
-}
-
-/// The yosys payload comes back as an arbitrary JSON object. We don't
-/// fully type it on the client - we hand it to netlistsvg and mine a
-/// few `vhdl_*_pos` fields out for click navigation.
-export type YosysPayload = {
-    modules?: Record<string, ModuleData>;
-};
-
-interface ModuleData {
-    cells?: Record<string, CellData>;
-    vhdl_entity_pos?: VhdlPos;
-}
-
-interface CellData {
-    type?: string;
-    vhdl_instance_pos?: VhdlPos;
-    vhdl_entity_pos?: VhdlPos;
-}
-
-interface VhdlPos {
+interface SrcRange {
     file: string;
     start: { line: number; character: number };
     end: { line: number; character: number };
 }
-
-interface NavigateMessage {
-    type: 'navigate';
-    pos: VhdlPos;
-}
-
-interface DrillMessage {
-    type: 'drill';
-    library: string;
-    entity: string;
-}
-
-interface BackMessage {
-    type: 'back';
-}
-
-interface JumpMessage {
-    type: 'jump';
-    /// Truncate the nav stack so this index becomes the new top.
-    index: number;
-}
-
-interface ReloadMessage {
-    type: 'reload';
-}
-
-interface SetGranularityMessage {
-    type: 'granularity';
-    value: Granularity;
-}
-
-type IncomingMessage =
-    | NavigateMessage
-    | DrillMessage
-    | BackMessage
-    | JumpMessage
-    | ReloadMessage
-    | SetGranularityMessage;
 
 interface NavEntry {
     library: string;
     entity: string;
 }
 
-/// View granularity. `all` = current behavior (instances + processes).
-/// `modulesOnly` hides process cells and any nets that lose all
-/// endpoints once processes are gone.
-type Granularity = 'all' | 'modulesOnly';
+type IncomingMessage =
+    | { type: 'ready' }
+    | { type: 'reload' }
+    | { type: 'back' }
+    | { type: 'navigate'; pos: SrcRange }
+    | { type: 'drill'; library: string; entity: string }
+    | { type: 'jump'; index: number };
 
-/// Keyed by the *initial* entity (the bottom of the nav stack). Same
-/// starting point reuses an existing panel; different starting point
-/// opens a new one. Drilling never opens a new panel - it pushes onto
-/// the active panel's stack.
+/** Open panels keyed by the entity they were opened for (bottom of the nav stack). */
 const panels = new Map<string, DataFlowPanel>();
 
-/// Filter the yosys payload according to the requested granularity.
-/// `modulesOnly` removes process cells. The cell's connection bits
-/// disappear with it; netnames keep their bit list (unaffected) so
-/// nets still render with their non-process endpoints.
-function applyGranularity(
-    payload: YosysPayload,
-    granularity: Granularity
-): YosysPayload {
-    if (granularity === 'all') {
-        return payload;
-    }
-    // Deep-clone via JSON to avoid mutating the cached lastPayload.
-    const out: YosysPayload = JSON.parse(JSON.stringify(payload));
-    for (const m of Object.values(out.modules ?? {})) {
-        if (!m.cells) continue;
-        const filtered: Record<string, CellData> = {};
-        for (const [name, cell] of Object.entries(m.cells)) {
-            const t = typeof cell.type === 'string' ? cell.type : '';
-            const sep = t.indexOf(' : ');
-            const kind = sep < 0 ? t : t.slice(sep + 3);
-            if (!kind.startsWith('process')) {
-                filtered[name] = cell;
-            }
-        }
-        m.cells = filtered;
-    }
-    return out;
-}
-
+/**
+ * @brief Webview panel hosting the data-flow schematic of one entity.
+ * The webview script (dist/dataflowView.js) lays out and draws the graph;
+ * this side fetches vhdl/dataFlow, keeps the drill-down stack and opens
+ * source locations.
+ */
 export class DataFlowPanel {
     private readonly panel: WebviewPanel;
     private readonly initialKey: string;
-    /// Navigation history. First entry is what the panel was opened
-    /// for; pushing happens on drill, popping on back / breadcrumb.
     private stack: NavEntry[];
-    /// Persists across navigation - users typically pick a granularity
-    /// once and want it to stick.
-    private granularity: Granularity = 'all';
-    /// Last fetched payload, kept so granularity toggles can re-render
-    /// without going back to the LSP.
-    private lastPayload: YosysPayload | undefined;
+    private ready = false;
 
-    constructor(
+    private constructor(
         library: string,
         entity: string,
+        private readonly extensionUri: Uri,
         private readonly getClient: () => LanguageClient,
         private readonly log: OutputChannel
     ) {
         this.stack = [{ library, entity }];
         this.initialKey = `${library}.${entity}`;
-        this.panel = window.createWebviewPanel(
-            'vhdlDataflow',
-            this.panelTitle(),
-            ViewColumn.Active,
-            {
-                enableScripts: true,
-                retainContextWhenHidden: true,
-            }
-        );
-        this.panel.onDidDispose(() => {
-            panels.delete(this.initialKey);
+        const dist = Uri.joinPath(extensionUri, 'dist');
+        this.panel = window.createWebviewPanel('vhdlDataflow', this.panelTitle(), ViewColumn.Active, {
+            enableScripts: true,
+            retainContextWhenHidden: true,
+            localResourceRoots: [dist],
         });
+        this.panel.onDidDispose(() => panels.delete(this.initialKey));
         this.panel.webview.onDidReceiveMessage((msg: IncomingMessage) => {
             this.handleMessage(msg).catch((err) => {
                 this.log.appendLine(`dataflow webview message error: ${err}`);
             });
         });
-        this.panel.webview.html = this.placeholderHtml(
-            `Loading data-flow for ${this.currentKey()}...`
-        );
-        void this.refresh();
+        this.panel.webview.html = this.html(this.panel.webview.asWebviewUri(Uri.joinPath(dist, 'dataflowView.js')));
     }
 
     static showOrCreate(
         library: string,
         entity: string,
+        extensionUri: Uri,
         getClient: () => LanguageClient,
         log: OutputChannel
     ): DataFlowPanel {
@@ -200,16 +85,11 @@ export class DataFlowPanel {
         const existing = panels.get(key);
         if (existing) {
             existing.panel.reveal(ViewColumn.Active);
-            // Reset the nav stack to the requested entity so a
-            // re-invocation of "Show Data Flow" feels like a fresh
-            // start, not a continuation of wherever the panel
-            // happened to have been left.
             existing.stack = [{ library, entity }];
-            existing.panel.title = existing.panelTitle();
             void existing.refresh();
             return existing;
         }
-        const panel = new DataFlowPanel(library, entity, getClient, log);
+        const panel = new DataFlowPanel(library, entity, extensionUri, getClient, log);
         panels.set(key, panel);
         return panel;
     }
@@ -218,453 +98,219 @@ export class DataFlowPanel {
         return this.stack[this.stack.length - 1];
     }
 
-    private currentKey(): string {
-        const c = this.current();
-        return `${c.library}.${c.entity}`;
-    }
-
     private panelTitle(): string {
-        if (this.stack.length === 1) {
-            return `Data flow: ${this.currentKey()}`;
-        }
-        return `Data flow: ${this.stack[0].library}.${this.stack[0].entity} > ${this.current().entity}`;
+        const top = this.stack[0];
+        return this.stack.length === 1
+            ? `Data flow: ${top.library}.${top.entity}`
+            : `Data flow: ${top.entity} > ${this.current().entity}`;
     }
 
     async refresh(): Promise<void> {
+        if (!this.ready) {
+            return;
+        }
         const c = this.current();
-        try {
-            const payload = await this.getClient().sendRequest<YosysPayload>(
-                DATA_FLOW_REQUEST,
-                { library: c.library, entity: c.entity }
-            );
-            this.lastPayload = payload;
-            await this.rerender();
-            return;
-        } catch (err) {
-            const detail =
-                typeof err === 'object' &&
-                err !== null &&
-                'message' in err &&
-                typeof (err as { message?: unknown }).message === 'string'
-                    ? (err as { message: string }).message
-                    : String(err);
-            this.log.appendLine(`Data-flow request failed: ${detail}`);
-            this.panel.webview.html = this.placeholderHtml(
-                `Failed to load data-flow for ${this.currentKey()}:\n${detail}`
-            );
-        }
-    }
-
-    /// Re-render from the last fetched payload. Cheap: no LSP request,
-    /// just re-runs the granularity filter and netlistsvg pass.
-    private async rerender(): Promise<void> {
-        if (!this.lastPayload) {
-            return;
-        }
-        const filtered = applyGranularity(this.lastPayload, this.granularity);
-        const svg = await this.renderSvg(filtered);
         this.panel.title = this.panelTitle();
-        this.panel.webview.html = this.renderHtml(filtered, svg);
-    }
-
-    private renderSvg(payload: YosysPayload): Promise<string> {
-        return new Promise((resolve, reject) => {
-            try {
-                netlistsvg.render(
-                    defaultSkin,
-                    payload,
-                    (err: unknown, svg: string) => {
-                        if (err) {
-                            reject(err);
-                        } else {
-                            resolve(svg);
-                        }
-                    }
-                );
-            } catch (err) {
-                reject(err);
-            }
-        });
+        void this.panel.webview.postMessage({ type: 'loading', message: `${c.library}.${c.entity}` });
+        try {
+            const df = await this.getClient().sendRequest<unknown>(DATA_FLOW_REQUEST, {
+                library: c.library,
+                entity: c.entity,
+            });
+            void this.panel.webview.postMessage({ type: 'graph', df, stack: this.stack });
+        } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            this.log.appendLine(`Data-flow request failed: ${detail}`);
+            void this.panel.webview.postMessage({
+                type: 'error',
+                message: `Failed to load data flow for ${c.library}.${c.entity}: ${detail}`,
+            });
+        }
     }
 
     private async handleMessage(msg: IncomingMessage): Promise<void> {
-        if (msg.type === 'reload') {
-            await this.refresh();
-            return;
-        }
-        if (msg.type === 'navigate') {
-            const uri = Uri.file(msg.pos.file);
-            const range = new Range(
-                new Position(msg.pos.start.line, msg.pos.start.character),
-                new Position(msg.pos.end.line, msg.pos.end.character)
-            );
-            const doc = await workspace.openTextDocument(uri);
-            await window.showTextDocument(doc, {
-                viewColumn: ViewColumn.Beside,
-                selection: range,
-                preserveFocus: false,
-            });
-            return;
-        }
-        if (msg.type === 'drill') {
-            // Drill in-place: push onto this panel's nav stack instead
-            // of opening a new panel. Keeps the navigation linear and
-            // back-traversable, the way schematic explorers usually
-            // behave.
-            this.stack.push({ library: msg.library, entity: msg.entity });
-            await this.refresh();
-            return;
-        }
-        if (msg.type === 'back') {
-            if (this.stack.length > 1) {
-                this.stack.pop();
+        switch (msg.type) {
+            case 'ready':
+                this.ready = true;
                 await this.refresh();
-            }
-            return;
-        }
-        if (msg.type === 'jump') {
-            // Truncate the stack so msg.index becomes the new top.
-            if (msg.index >= 0 && msg.index < this.stack.length - 1) {
-                this.stack = this.stack.slice(0, msg.index + 1);
+                return;
+            case 'reload':
                 await this.refresh();
+                return;
+            case 'navigate': {
+                const range = new Range(
+                    new Position(msg.pos.start.line, msg.pos.start.character),
+                    new Position(msg.pos.end.line, msg.pos.end.character)
+                );
+                const doc = await workspace.openTextDocument(Uri.file(msg.pos.file));
+                await window.showTextDocument(doc, { viewColumn: ViewColumn.Beside, selection: range });
+                return;
             }
-            return;
-        }
-        if (msg.type === 'granularity') {
-            if (msg.value !== this.granularity) {
-                this.granularity = msg.value;
-                await this.rerender();
-            }
-            return;
+            case 'drill':
+                this.stack.push({ library: msg.library, entity: msg.entity });
+                await this.refresh();
+                return;
+            case 'back':
+                if (this.stack.length > 1) {
+                    this.stack.pop();
+                    await this.refresh();
+                }
+                return;
+            case 'jump':
+                if (msg.index >= 0 && msg.index < this.stack.length - 1) {
+                    this.stack = this.stack.slice(0, msg.index + 1);
+                    await this.refresh();
+                }
+                return;
         }
     }
 
-    private renderHtml(payload: YosysPayload, svg: string): string {
-        const moduleNames = Object.keys(payload.modules ?? {});
-        const moduleName = moduleNames[0] ?? '';
-        const cellIndex: Record<
-            string,
-            { instance?: VhdlPos; entity?: VhdlPos; type?: string }
-        > = {};
-        if (moduleName) {
-            const m = payload.modules?.[moduleName];
-            for (const [name, cell] of Object.entries(m?.cells ?? {})) {
-                cellIndex[name] = {
-                    instance: cell.vhdl_instance_pos,
-                    entity: cell.vhdl_entity_pos,
-                    type: cell.type,
-                };
-            }
-        }
-        const cellIndexJson = JSON.stringify(cellIndex);
-        const moduleEntityPosJson = JSON.stringify(
-            payload.modules?.[moduleName]?.vhdl_entity_pos ?? null
-        );
-        const stackJson = JSON.stringify(this.stack);
-        const canGoBack = this.stack.length > 1;
-        const granularityValue = this.granularity;
-
-        const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';`;
+    private html(script: Uri): string {
+        const nonce = [...Array(32)].map(() => Math.floor(Math.random() * 36).toString(36)).join('');
+        const csp = [
+            "default-src 'none'",
+            `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+            `script-src 'nonce-${nonce}'`,
+        ].join('; ');
         return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
-<title>Data flow ${this.escape(this.currentKey())}</title>
-<style>
-body { font-family: var(--vscode-editor-font-family, monospace); margin: 0; padding: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); height: 100vh; display: flex; flex-direction: column; }
-header { padding: 6px 12px; border-bottom: 1px solid var(--vscode-panel-border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-header button { font: inherit; padding: 2px 8px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; cursor: pointer; border-radius: 2px; }
-header button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
-header button:disabled { opacity: 0.4; cursor: default; }
-header .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-left: auto; }
-header select { font: inherit; padding: 2px 6px; background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); border-radius: 2px; }
-#crumbs { font-size: 12px; display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; flex-wrap: wrap; }
-.crumb { padding: 1px 4px; border-radius: 2px; cursor: pointer; }
-.crumb:hover { background: var(--vscode-list-hoverBackground); }
-.crumb.current { font-weight: bold; cursor: default; }
-.crumb.current:hover { background: transparent; }
-.crumb-sep { color: var(--vscode-descriptionForeground); }
-#viewport { flex: 1; overflow: hidden; background: var(--vscode-editor-background); position: relative; cursor: grab; }
-#viewport.panning { cursor: grabbing; }
-#stage { transform-origin: 0 0; will-change: transform; }
-#stage svg { background: white; max-width: none; display: block; }
-#zoomctl { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 4px; background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-panel-border); border-radius: 3px; padding: 2px; opacity: 0.85; }
-#zoomctl button { font: inherit; padding: 2px 8px; min-width: 26px; background: transparent; color: var(--vscode-foreground); border: 0; cursor: pointer; }
-#zoomctl button:hover { background: var(--vscode-list-hoverBackground); }
-#zoomctl span { font-size: 11px; color: var(--vscode-descriptionForeground); align-self: center; padding: 0 4px; min-width: 36px; text-align: center; }
-g[id^="cell_"] { cursor: pointer; }
-g[id^="cell_"]:hover rect, g[id^="cell_"]:hover path { stroke: var(--vscode-focusBorder); stroke-width: 1.5; }
-/* Visual distinction by cell kind. Light fill with thin matching */
-/* stroke - keeps the schematic readable in both light and dark    */
-/* themes since the webview canvas itself is white-backed.         */
-g.cell-instance > rect:not(.splitjoinBody) { fill: #eaf2ff; stroke: #5a7fbf; }
-g.cell-process > rect:not(.splitjoinBody) { fill: #fff2d6; stroke: #c9962b; }
-g.cell-process > path { stroke: #c9962b; }
-</style>
+<style>${DATAFLOW_CSS}</style>
 </head>
 <body>
 <header>
-  <button id="back" title="Up one level" ${canGoBack ? '' : 'disabled'}>&#x2191;</button>
+  <button id="up" title="Up one level (Backspace)">&#8593;</button>
   <nav id="crumbs"></nav>
-  <span class="hint">click: jump to source - shift+click: drill in</span>
-  <select id="granularity" title="View granularity">
-    <option value="all"${granularityValue === 'all' ? ' selected' : ''}>modules + processes</option>
-    <option value="modulesOnly"${granularityValue === 'modulesOnly' ? ' selected' : ''}>modules only</option>
-  </select>
-  <button id="reload" title="Reload">&#x21bb;</button>
+  <input id="search" type="search" placeholder="find net or cell  ( / )" spellcheck="false" />
+  <label title="Show processes as cells"><input id="procs" type="checkbox" /> processes</label>
+  <label title="Group pins sharing a name prefix into buses"><input id="buses" type="checkbox" /> buses</label>
+  <label title="Smallest group that forms a bus">min <input id="minbus" type="number" min="2" max="16" /></label>
+  <span id="zoom">100%</span>
+  <button id="fit" title="Fit (F)">fit</button>
+  <button id="reload" title="Reload">reload</button>
 </header>
 <div id="viewport">
-  <div id="stage">${svg}</div>
-  <div id="zoomctl">
-    <button id="zoomOut" title="Zoom out (or wheel)">&#x2212;</button>
-    <span id="zoomLevel">100%</span>
-    <button id="zoomIn" title="Zoom in (or wheel)">+</button>
-    <button id="zoomFit" title="Fit to viewport">fit</button>
-    <button id="zoomReset" title="Reset to 100%">1:1</button>
-  </div>
+  <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div id="status" hidden></div>
+  <div id="chips" hidden></div>
+  <div id="help">hover: trace - click: highlight (ctrl: add) - double-click: source / expand bus - right-click: more</div>
 </div>
-<script>
-const vscode = acquireVsCodeApi();
-const cellIndex = ${cellIndexJson};
-const moduleEntityPos = ${moduleEntityPosJson};
-const stack = ${stackJson};
-
-function navigate(pos) { if (pos) vscode.postMessage({ type: 'navigate', pos }); }
-
-function drill(typePath) {
-    if (!typePath || typePath.startsWith('$')) return;
-    const dot = typePath.indexOf('.');
-    if (dot < 0) return;
-    vscode.postMessage({ type: 'drill', library: typePath.slice(0, dot), entity: typePath.slice(dot + 1) });
-}
-
-// Cell click handlers + visual classification (entity instance vs
-// process). Cell type is formatted as "<name> : <kind>" where kind
-// is either "process (sync|comb)" or "library.entity"; we classify
-// off the kind side. Drill targets the bound entity so we extract
-// it from the second half before posting.
-function splitType(t) {
-    if (typeof t !== 'string') return { name: '', kind: '' };
-    const sep = t.indexOf(' : ');
-    return sep < 0
-        ? { name: '', kind: t }
-        : { name: t.slice(0, sep), kind: t.slice(sep + 3) };
-}
-document.querySelectorAll('g[id^="cell_"]').forEach((node) => {
-    const name = node.id.replace(/^cell_/, '');
-    const info = cellIndex[name];
-    if (!info) return;
-    const { kind } = splitType(info.type);
-    if (kind.startsWith('process')) {
-        node.classList.add('cell-process');
-    } else {
-        node.classList.add('cell-instance');
-    }
-    node.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        if (ev.shiftKey) {
-            drill(kind);
-        } else if (info.instance) {
-            navigate(info.instance);
-        }
-    });
-});
-
-// Breadcrumb. Last entry is the current view (no click); earlier
-// entries jump back to that level.
-const crumbs = document.getElementById('crumbs');
-stack.forEach((entry, i) => {
-    if (i > 0) {
-        const sep = document.createElement('span');
-        sep.className = 'crumb-sep';
-        sep.textContent = ' > ';
-        crumbs.appendChild(sep);
-    }
-    const span = document.createElement('span');
-    span.className = 'crumb' + (i === stack.length - 1 ? ' current' : '');
-    span.textContent = entry.entity;
-    span.title = entry.library + '.' + entry.entity;
-    if (i === stack.length - 1) {
-        // Click on current crumb = jump to the entity declaration.
-        if (moduleEntityPos) {
-            span.style.cursor = 'pointer';
-            span.addEventListener('click', () => navigate(moduleEntityPos));
-        }
-    } else {
-        span.addEventListener('click', () => vscode.postMessage({ type: 'jump', index: i }));
-    }
-    crumbs.appendChild(span);
-});
-
-document.getElementById('back').addEventListener('click', () => {
-    vscode.postMessage({ type: 'back' });
-});
-document.getElementById('reload').addEventListener('click', () => {
-    vscode.postMessage({ type: 'reload' });
-});
-document.getElementById('granularity').addEventListener('change', (ev) => {
-    vscode.postMessage({ type: 'granularity', value: ev.target.value });
-});
-
-// ----- Pan + zoom on the SVG -----
-// Plain CSS transform on a <div id="stage"> wrapping the SVG.
-// We track scale + (tx,ty) in viewport-pixel units and rebuild the
-// transform string. Wheel zooms toward the mouse position; left-
-// or middle-click drag pans.
-const viewport = document.getElementById('viewport');
-const stage = document.getElementById('stage');
-const zoomLevelEl = document.getElementById('zoomLevel');
-let scale = 1;
-let tx = 0;
-let ty = 0;
-const MIN_SCALE = 0.05;
-const MAX_SCALE = 20;
-
-function applyTransform() {
-    stage.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + scale + ')';
-    zoomLevelEl.textContent = Math.round(scale * 100) + '%';
-}
-applyTransform();
-
-function setScale(newScale, centerX, centerY) {
-    const clamped = Math.max(MIN_SCALE, Math.min(MAX_SCALE, newScale));
-    if (clamped === scale) return;
-    // Keep the point under (centerX, centerY) fixed in screen space.
-    const ratio = clamped / scale;
-    tx = centerX - ratio * (centerX - tx);
-    ty = centerY - ratio * (centerY - ty);
-    scale = clamped;
-    applyTransform();
-}
-
-viewport.addEventListener('wheel', (ev) => {
-    ev.preventDefault();
-    const rect = viewport.getBoundingClientRect();
-    const cx = ev.clientX - rect.left;
-    const cy = ev.clientY - rect.top;
-    const factor = Math.pow(1.0015, -ev.deltaY);
-    setScale(scale * factor, cx, cy);
-}, { passive: false });
-
-let panning = false;
-let panStartX = 0;
-let panStartY = 0;
-let panStartTx = 0;
-let panStartTy = 0;
-viewport.addEventListener('mousedown', (ev) => {
-    // Left or middle button. Skip if the click landed on a cell -
-    // those take precedence so we don't fight the navigation handler.
-    if (ev.button !== 0 && ev.button !== 1) return;
-    if (ev.button === 0 && ev.target.closest && ev.target.closest('g[id^="cell_"]')) return;
-    panning = true;
-    panStartX = ev.clientX;
-    panStartY = ev.clientY;
-    panStartTx = tx;
-    panStartTy = ty;
-    viewport.classList.add('panning');
-    ev.preventDefault();
-});
-window.addEventListener('mousemove', (ev) => {
-    if (!panning) return;
-    tx = panStartTx + (ev.clientX - panStartX);
-    ty = panStartTy + (ev.clientY - panStartY);
-    applyTransform();
-});
-window.addEventListener('mouseup', () => {
-    if (panning) {
-        panning = false;
-        viewport.classList.remove('panning');
-    }
-});
-
-document.getElementById('zoomIn').addEventListener('click', () => {
-    const r = viewport.getBoundingClientRect();
-    setScale(scale * 1.25, r.width / 2, r.height / 2);
-});
-document.getElementById('zoomOut').addEventListener('click', () => {
-    const r = viewport.getBoundingClientRect();
-    setScale(scale / 1.25, r.width / 2, r.height / 2);
-});
-document.getElementById('zoomReset').addEventListener('click', () => {
-    scale = 1; tx = 0; ty = 0; applyTransform();
-});
-document.getElementById('zoomFit').addEventListener('click', () => {
-    const svgEl = stage.querySelector('svg');
-    if (!svgEl) return;
-    const r = viewport.getBoundingClientRect();
-    const bb = svgEl.getBoundingClientRect();
-    // Use the bounding box at scale=1 to compute fit; we read the
-    // attributes since current bb is post-transform.
-    const w = parseFloat(svgEl.getAttribute('width') || bb.width / scale);
-    const h = parseFloat(svgEl.getAttribute('height') || bb.height / scale);
-    const sx = (r.width - 24) / w;
-    const sy = (r.height - 24) / h;
-    scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.min(sx, sy)));
-    tx = (r.width - w * scale) / 2;
-    ty = (r.height - h * scale) / 2;
-    applyTransform();
-});
-
-// Keyboard shortcuts when the panel is focused.
-window.addEventListener('keydown', (ev) => {
-    if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
-    if ((ev.key === '+' || ev.key === '=') && (ev.ctrlKey || ev.metaKey)) {
-        ev.preventDefault();
-        document.getElementById('zoomIn').click();
-    } else if (ev.key === '-' && (ev.ctrlKey || ev.metaKey)) {
-        ev.preventDefault();
-        document.getElementById('zoomOut').click();
-    } else if (ev.key === '0' && (ev.ctrlKey || ev.metaKey)) {
-        ev.preventDefault();
-        document.getElementById('zoomReset').click();
-    }
-});
-</script>
+<div id="tip" hidden></div>
+<div id="menu" hidden></div>
+<script nonce="${nonce}" src="${script.toString()}"></script>
 </body>
 </html>`;
     }
-
-    private placeholderHtml(message: string): string {
-        const csp = `default-src 'none'; style-src 'unsafe-inline';`;
-        return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta http-equiv="Content-Security-Policy" content="${csp}" />
-<style>
-body { font-family: var(--vscode-editor-font-family, monospace); padding: 16px; color: var(--vscode-foreground); background: var(--vscode-editor-background); white-space: pre-wrap; }
-</style>
-</head>
-<body>${this.escape(message)}</body>
-</html>`;
-    }
-
-    /// Public hook so the breadcrumb in the panel header can be
-    /// extended later if needed (e.g. by an external "go up" command).
-    levelUp(): void {
-        if (this.stack.length > 1) {
-            this.stack.pop();
-            void this.refresh();
-        }
-    }
-
-    private escape(s: string): string {
-        return s.replace(/[&<>"']/g, (c) => {
-            switch (c) {
-                case '&':
-                    return '&amp;';
-                case '<':
-                    return '&lt;';
-                case '>':
-                    return '&gt;';
-                case '"':
-                    return '&quot;';
-                case "'":
-                    return '&#39;';
-                default:
-                    return c;
-            }
-        });
-    }
 }
+
+/** Webview styles; colors come from the VS Code theme so both light and dark themes work. */
+export const DATAFLOW_CSS = `
+:root {
+  --fg: var(--vscode-editor-foreground);
+  --bg: var(--vscode-editor-background);
+  --dim: var(--vscode-descriptionForeground);
+  --wire: color-mix(in srgb, var(--fg) 55%, var(--bg));
+  --cell: var(--vscode-editorWidget-background);
+  --cell-edge: color-mix(in srgb, var(--fg) 45%, var(--bg));
+  --hov: var(--vscode-editorCursor-foreground, var(--fg));
+  --c0: var(--vscode-charts-blue);
+  --c1: var(--vscode-charts-orange);
+  --c2: var(--vscode-charts-green);
+  --c3: var(--vscode-charts-purple);
+  --c4: var(--vscode-charts-red);
+  --c5: var(--vscode-charts-yellow);
+  --warn: var(--vscode-editorWarning-foreground);
+}
+html, body { height: 100%; }
+body { margin: 0; padding: 0; color: var(--fg); background: var(--bg); display: flex; flex-direction: column; overflow: hidden;
+  font-family: var(--vscode-font-family); font-size: 12px; }
+header { padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); display: flex; align-items: center; gap: 8px; }
+header button { font: inherit; padding: 2px 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: 0; border-radius: 2px; cursor: pointer; }
+header button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+header button:disabled { opacity: 0.4; cursor: default; }
+header label { display: flex; align-items: center; gap: 3px; color: var(--dim); white-space: nowrap; }
+header input[type=number] { width: 3em; }
+header input { font: inherit; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 1px 4px; }
+#search { width: 16em; }
+#search.nomatch { outline: 1px solid var(--vscode-inputValidation-errorBorder); }
+#crumbs { flex: 1; min-width: 0; display: flex; gap: 2px; align-items: center; overflow: hidden; white-space: nowrap; }
+.crumb { padding: 1px 4px; border-radius: 2px; cursor: pointer; }
+.crumb:hover { background: var(--vscode-list-hoverBackground); }
+.crumb.current { font-weight: bold; }
+.sep { color: var(--dim); }
+#zoom { color: var(--dim); min-width: 3.5em; text-align: right; }
+#viewport { flex: 1; position: relative; overflow: hidden; cursor: default; user-select: none; }
+#viewport.panning { cursor: grabbing; }
+#canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+  font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; text-rendering: geometricPrecision; }
+#status { position: absolute; left: 50%; top: 40%; transform: translateX(-50%); padding: 8px 14px; border-radius: 3px;
+  background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-editorWidget-border); white-space: pre-wrap; max-width: 80%; }
+#help { position: absolute; right: 8px; bottom: 6px; color: var(--dim); font-size: 11px; pointer-events: none; padding: 1px 6px; border-radius: 3px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent); }
+#chips { position: absolute; left: 8px; bottom: 6px; display: flex; flex-wrap: wrap; gap: 4px; max-width: 60%; }
+.chip { display: flex; align-items: center; gap: 5px; padding: 2px 4px 2px 6px; border-radius: 10px; cursor: pointer;
+  background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-family: var(--vscode-editor-font-family); font-size: 11px; }
+.chip em { opacity: 0.7; font-style: normal; }
+.chip b { padding: 0 4px; border-radius: 8px; font-weight: normal; opacity: 0.7; }
+.chip b:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+.sw { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.sw.c0 { background: var(--c0); } .sw.c1 { background: var(--c1); } .sw.c2 { background: var(--c2); }
+.sw.c3 { background: var(--c3); } .sw.c4 { background: var(--c4); } .sw.c5 { background: var(--c5); }
+#tip, #menu { position: fixed; z-index: 10; background: var(--vscode-editorHoverWidget-background); color: var(--vscode-editorHoverWidget-foreground);
+  border: 1px solid var(--vscode-editorHoverWidget-border); border-radius: 3px; box-shadow: 0 2px 8px var(--vscode-widget-shadow); }
+#tip { padding: 5px 8px; max-width: 480px; pointer-events: none; font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 1.45; }
+#tip hr { border: 0; border-top: 1px solid var(--vscode-editorHoverWidget-border); margin: 4px 0; }
+#tip em, #tip .dim { color: var(--dim); font-style: normal; }
+#tip .members { color: var(--dim); word-break: break-all; }
+#tip .warn { color: var(--warn); }
+#menu { padding: 3px 0; min-width: 180px; background: var(--vscode-menu-background); color: var(--vscode-menu-foreground); }
+.mi { padding: 3px 14px; cursor: pointer; white-space: nowrap; }
+.mi:hover { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+[hidden] { display: none !important; }
+
+/* Schematic. --inv is 1/zoom: widths scaled by max(1, --inv) stay at least their nominal screen width when zoomed out. */
+#canvas { --inv: 1; }
+.wire, .hl, .sl { fill: none; stroke-linejoin: round; }
+.wire { stroke: var(--wire); stroke-width: calc(1.1px * max(1, var(--inv))); }
+.wire.bus { stroke-width: calc(3px * max(1, var(--inv))); }
+.wire.cdc { stroke: var(--warn); stroke-dasharray: 6 3; }
+.junction { fill: var(--wire); }
+.hit { fill: none; stroke: transparent; stroke-width: calc(9px * max(1, var(--inv))); pointer-events: stroke; cursor: pointer; }
+.hl { stroke: var(--hov); stroke-width: calc(2.2px * max(1, var(--inv))); }
+.hl.bus { stroke-width: calc(4.5px * max(1, var(--inv))); }
+.sl { stroke-width: calc(2.4px * max(1, var(--inv))); }
+.sl.bus { stroke-width: calc(4.5px * max(1, var(--inv))); }
+.sl.c0 { stroke: var(--c0); } .sl.c1 { stroke: var(--c1); } .sl.c2 { stroke: var(--c2); }
+.sl.c3 { stroke: var(--c3); } .sl.c4 { stroke: var(--c4); } .sl.c5 { stroke: var(--c5); }
+.has-sel .wires, .has-sel .junctions { opacity: 0.3; }
+.has-sel .cell:not(.touched) { opacity: 0.45; }
+.cell .body { fill: var(--cell); stroke: var(--cell-edge); stroke-width: calc(1px * max(1, var(--inv))); }
+.cell:hover > .body { stroke: var(--vscode-focusBorder); }
+.k-process .body { fill: color-mix(in srgb, var(--c5) 10%, var(--cell)); stroke: color-mix(in srgb, var(--c5) 60%, var(--bg)); }
+.k-input .body, .k-output .body { fill: color-mix(in srgb, var(--fg) 8%, var(--bg)); }
+.body.busport { stroke-width: calc(2px * max(1, var(--inv))); }
+.headsep { stroke: var(--cell-edge); stroke-width: 0.5; opacity: 0.6; }
+.title { fill: var(--fg); font-weight: bold; }
+.subtitle { fill: var(--dim); font-size: 10px; }
+.subtitle.unresolved { fill: var(--warn); }
+.portlabel, .pinlabel { fill: var(--fg); }
+.pin.bus .pinlabel, .portlabel { font-weight: bold; }
+.buswidth { fill: var(--dim); font-weight: normal; }
+.pin.nc .pinlabel { fill: var(--dim); }
+.ncmark { fill: none; stroke: var(--dim); stroke-width: 1; }
+.clkmark { fill: none; stroke: var(--fg); stroke-width: 1; }
+.pinhit { fill: transparent; cursor: pointer; }
+.pin:hover .pinhit { fill: var(--vscode-list-hoverBackground); }
+.pin-hov .pinlabel { fill: var(--hov); font-weight: bold; }
+.pin-sel-c0 .pinlabel { fill: var(--c0); } .pin-sel-c1 .pinlabel { fill: var(--c1); } .pin-sel-c2 .pinlabel { fill: var(--c2); }
+.pin-sel-c3 .pinlabel { fill: var(--c3); } .pin-sel-c4 .pinlabel { fill: var(--c4); } .pin-sel-c5 .pinlabel { fill: var(--c5); }
+.pin-sel .pinlabel { font-weight: bold; }
+.drill { cursor: pointer; }
+.drill rect { fill: transparent; stroke: var(--cell-edge); stroke-width: 0.8; }
+.drill path { fill: none; stroke: var(--fg); stroke-width: 1.4; }
+.drill:hover rect { fill: var(--vscode-list-hoverBackground); stroke: var(--vscode-focusBorder); }
+.lod-far .pinlabel, .lod-far .subtitle, .lod-far .drill { display: none; }
+.lod-very-far .title, .lod-very-far .portlabel { display: none; }
+`;

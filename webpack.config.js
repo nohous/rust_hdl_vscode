@@ -18,10 +18,6 @@ const config = {
     devtool: 'source-map',
     externals: {
         vscode: 'commonjs vscode', // the vscode-module is created on-the-fly and must be excluded. Add other modules that cannot be webpack'ed, 📖 -> https://webpack.js.org/configuration/externals/
-        // Optional native dependency of elkjs/netlistsvg used for
-        // multi-threaded layout. Not installed; ELK falls back to a
-        // synchronous in-process layout if this require throws.
-        'webworker-threads': 'commonjs webworker-threads',
     },
     resolve: {
         alias: {
@@ -52,13 +48,46 @@ const config = {
                     },
                 ],
             },
+        ],
+    },
+};
+
+/** Data-flow schematic webview script: browser target, ELK runs in-page. */
+/**@type {import('webpack').Configuration}*/
+const dataflowView = {
+    target: 'web',
+    entry: './client/webview/main.ts',
+    output: {
+        path: path.resolve(__dirname, 'dist'),
+        filename: 'dataflowView.js',
+    },
+    devtool: 'source-map',
+    resolve: {
+        extensions: ['.ts', '.js'],
+        modules: [path.resolve(__dirname, 'client/node_modules'), 'node_modules'],
+        // elk.bundled.js probes for this optional worker shim; the in-page
+        // fallback is used instead.
+        fallback: { 'web-worker': false },
+    },
+    optimization: {
+        minimize: false,
+    },
+    module: {
+        rules: [
             {
-                // Inline netlistsvg's skin SVG into the bundle as a
-                // string so we don't need to ship node_modules.
-                test: /netlistsvg[\\/]lib[\\/].*\.svg$/,
-                type: 'asset/source',
+                test: /\.ts$/,
+                exclude: /node_modules/,
+                use: [
+                    {
+                        loader: 'ts-loader',
+                        options: {
+                            configFile: path.resolve(__dirname, 'client/webview/tsconfig.json'),
+                        },
+                    },
+                ],
             },
         ],
     },
 };
-module.exports = config;
+
+module.exports = [config, dataflowView];

@@ -201,6 +201,7 @@ export async function activate(ctx: ExtensionContext) {
             DataFlowPanel.showOrCreate(
                 top.library,
                 top.entity,
+                ctx.extensionUri,
                 () => client,
                 output
             );
@@ -227,6 +228,7 @@ export async function activate(ctx: ExtensionContext) {
                 DataFlowPanel.showOrCreate(
                     top.library,
                     top.entity,
+                    ctx.extensionUri,
                     () => client,
                     output
                 );

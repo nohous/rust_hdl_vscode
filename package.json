@@ -221,7 +221,8 @@
 		"test": "sh ./scripts/e2e.sh",
 		"webpack": "webpack --mode development",
 		"webpack-dev": "webpack --mode development --watch",
-		"test-compile": "tsc -p ./"
+		"test-compile": "tsc -p ./",
+		"test-webview": "tsc --outDir client/out/webview-test --module commonjs --target es2020 --lib es2020 --strict --skipLibCheck client/webview/schematic.test.ts && node client/out/webview-test/schematic.test.js"
 	},
 	"devDependencies": {
 		"@types/mocha": "^10.0.6",
