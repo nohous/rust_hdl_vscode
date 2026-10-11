@@ -14,6 +14,7 @@ import {
     GenerateScope,
     GenericValue,
     Layout,
+    StaticValue,
     Measure,
     Pin,
     readLayout,
@@ -30,9 +31,15 @@ interface VsCodeApi {
 }
 declare function acquireVsCodeApi(): VsCodeApi;
 
+interface GenericParam {
+    name: string;
+    value: StaticValue;
+}
+
 interface NavEntry {
     library: string;
     entity: string;
+    generics: GenericParam[];
 }
 
 interface Options {
@@ -675,15 +682,69 @@ function navigate(pos: SrcRange | null | undefined): void {
     }
 }
 
+/**
+ * @brief Opens the entity behind a cell, elaborated with the generic values
+ * the instance sets.
+ */
 function drill(cellId: string): void {
     const c = sch?.cells.find((x) => x.id === cellId);
     const path = c?.drill;
     if (!path) {
         return;
     }
+    const inst = df?.instances.find((i) => 'i:' + i.id === cellId);
+    const generics: GenericParam[] = (inst?.generics ?? [])
+        .filter((g): g is GenericValue & { value: StaticValue } => g.value !== null)
+        .map((g) => ({ name: g.name, value: g.value }));
     const dot = path.indexOf('.');
-    vscode.postMessage({ type: 'drill', library: path.slice(0, dot), entity: path.slice(dot + 1) });
+    vscode.postMessage({ type: 'drill', library: path.slice(0, dot), entity: path.slice(dot + 1), generics });
 }
+
+/**
+ * @brief Parses "N=4 FAST=true MODE=fast" into typed generic values.
+ * Integers and true/false become numbers and booleans, anything else a string
+ * without surrounding quotes.
+ */
+export function parseGenerics(text: string): GenericParam[] {
+    const out: GenericParam[] = [];
+    for (const item of text.split(/[\s,;]+/)) {
+        const eq = item.indexOf('=');
+        if (eq <= 0) {
+            continue;
+        }
+        const name = item.slice(0, eq).trim();
+        const raw = item.slice(eq + 1).trim();
+        const value: StaticValue = /^-?\d+$/.test(raw)
+            ? Number(raw)
+            : /^(true|false)$/i.test(raw)
+              ? raw.toLowerCase() === 'true'
+              : raw.replace(/^"(.*)"$/, '$1');
+        out.push({ name, value });
+    }
+    return out;
+}
+
+const genericsBox = $<HTMLInputElement>('generics');
+
+function showGenerics(): void {
+    const current = stack[stack.length - 1];
+    const set = current?.generics ?? [];
+    genericsBox.value = (df?.generics ?? [])
+        .map((g) => g.name + '=' + (g.value === null ? '?' : String(g.value)))
+        .join(' ');
+    genericsBox.classList.toggle('changed', set.length > 0);
+    genericsBox.hidden = (df?.generics.length ?? 0) === 0;
+}
+
+genericsBox.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+        vscode.postMessage({ type: 'generics', generics: parseGenerics(genericsBox.value) });
+        genericsBox.blur();
+    } else if (ev.key === 'Escape') {
+        showGenerics();
+        genericsBox.blur();
+    }
+});
 
 viewport.addEventListener('click', (ev) => {
     if (suppressClick) {
@@ -908,7 +969,7 @@ search.addEventListener('keydown', (ev) => {
 });
 
 window.addEventListener('keydown', (ev) => {
-    if (ev.target === search) {
+    if (ev.target === search || ev.target === genericsBox) {
         return;
     }
     if (ev.key === 'Escape') {
@@ -945,6 +1006,7 @@ window.addEventListener('message', (ev: MessageEvent) => {
             selections = [];
         }
         renderCrumbs();
+        showGenerics();
         void relayout(same);
     } else if (msg.type === 'loading') {
         showStatus('loading ' + (msg.message ?? '') + '...');

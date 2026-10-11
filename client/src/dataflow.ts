@@ -22,9 +22,17 @@ interface SrcRange {
     end: { line: number; character: number };
 }
 
+/** A generic value as the server takes it: integer, boolean or string. */
+interface GenericParam {
+    name: string;
+    value: number | boolean | string;
+}
+
 interface NavEntry {
     library: string;
     entity: string;
+    /** Generic values the level is elaborated with; absent generics keep their defaults. */
+    generics: GenericParam[];
 }
 
 type IncomingMessage =
@@ -32,7 +40,8 @@ type IncomingMessage =
     | { type: 'reload' }
     | { type: 'back' }
     | { type: 'navigate'; pos: SrcRange }
-    | { type: 'drill'; library: string; entity: string }
+    | { type: 'drill'; library: string; entity: string; generics: GenericParam[] }
+    | { type: 'generics'; generics: GenericParam[] }
     | { type: 'jump'; index: number };
 
 /** Open panels keyed by the entity they were opened for (bottom of the nav stack). */
@@ -57,7 +66,7 @@ export class DataFlowPanel {
         private readonly getClient: () => LanguageClient,
         private readonly log: OutputChannel
     ) {
-        this.stack = [{ library, entity }];
+        this.stack = [{ library, entity, generics: [] }];
         this.initialKey = `${library}.${entity}`;
         const dist = Uri.joinPath(extensionUri, 'dist');
         this.panel = window.createWebviewPanel('vhdlDataflow', this.panelTitle(), ViewColumn.Active, {
@@ -85,7 +94,7 @@ export class DataFlowPanel {
         const existing = panels.get(key);
         if (existing) {
             existing.panel.reveal(ViewColumn.Active);
-            existing.stack = [{ library, entity }];
+            existing.stack = [{ library, entity, generics: [] }];
             void existing.refresh();
             return existing;
         }
@@ -116,6 +125,7 @@ export class DataFlowPanel {
             const df = await this.getClient().sendRequest<unknown>(DATA_FLOW_REQUEST, {
                 library: c.library,
                 entity: c.entity,
+                generics: c.generics,
             });
             void this.panel.webview.postMessage({ type: 'graph', df, stack: this.stack });
         } catch (err) {
@@ -147,7 +157,11 @@ export class DataFlowPanel {
                 return;
             }
             case 'drill':
-                this.stack.push({ library: msg.library, entity: msg.entity });
+                this.stack.push({ library: msg.library, entity: msg.entity, generics: msg.generics });
+                await this.refresh();
+                return;
+            case 'generics':
+                this.current().generics = msg.generics;
                 await this.refresh();
                 return;
             case 'back':
@@ -184,6 +198,7 @@ export class DataFlowPanel {
   <button id="up" title="Up one level (Backspace)">&#8593;</button>
   <nav id="crumbs"></nav>
   <input id="search" type="search" placeholder="find net or cell  ( / )" spellcheck="false" />
+  <input id="generics" type="text" placeholder="generics: N=4 FAST=true" spellcheck="false" title="Generic values to elaborate with; Enter applies, empty restores the defaults" />
   <label title="Show processes as cells"><input id="procs" type="checkbox" /> processes</label>
   <label title="Group pins sharing a name prefix into buses"><input id="buses" type="checkbox" /> buses</label>
   <label title="Smallest group that forms a bus">min <input id="minbus" type="number" min="2" max="16" /></label>
@@ -233,7 +248,9 @@ header button:disabled { opacity: 0.4; cursor: default; }
 header label { display: flex; align-items: center; gap: 3px; color: var(--dim); white-space: nowrap; }
 header input[type=number] { width: 3em; }
 header input { font: inherit; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 2px; padding: 1px 4px; }
-#search { width: 16em; }
+#search { width: 14em; }
+#generics { width: 18em; font-family: var(--vscode-editor-font-family); }
+#generics.changed { border-color: var(--c3); }
 #search.nomatch { outline: 1px solid var(--vscode-inputValidation-errorBorder); }
 #crumbs { flex: 1; min-width: 0; display: flex; gap: 2px; align-items: center; overflow: hidden; white-space: nowrap; }
 .crumb { padding: 1px 4px; border-radius: 2px; cursor: pointer; }
@@ -263,7 +280,7 @@ header input { font: inherit; background: var(--vscode-input-background); color:
 #tip { padding: 5px 8px; max-width: 480px; pointer-events: none; font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 1.45; }
 #tip hr { border: 0; border-top: 1px solid var(--vscode-editorHoverWidget-border); margin: 4px 0; }
 #tip em, #tip .dim { color: var(--dim); font-style: normal; }
-#tip .members { color: var(--dim); word-break: break-all; }
+#tip .members { color: var(--dim); overflow-wrap: break-word; }
 #tip .warn { color: var(--warn); }
 #menu { padding: 3px 0; min-width: 180px; background: var(--vscode-menu-background); color: var(--vscode-menu-foreground); }
 .mi { padding: 3px 14px; cursor: pointer; white-space: nowrap; }
