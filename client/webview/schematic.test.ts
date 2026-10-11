@@ -4,10 +4,10 @@
 // Checks for the schematic model. Run with: npm run test-webview
 
 import * as assert from 'assert';
-import { buildSchematic, busLabel, DataFlow, DfEndpoint, groupByPrefix, netIds } from './schematic';
+import { buildSchematic, busLabel, DataFlow, DfEndpoint, generateTag, groupByPrefix, netIds } from './schematic';
 
 function ep(cell: string, port: string, direction: DfEndpoint['direction']): DfEndpoint {
-    return { kind: 'instance', cell_id: cell, port, direction, source_pos: null };
+    return { kind: 'instance', cell_id: cell, port, part: null, direction, source_pos: null };
 }
 
 function inst(id: string): DataFlow['instances'][number] {
@@ -20,6 +20,7 @@ function inst(id: string): DataFlow['instances'][number] {
         entity_pos: null,
         ports: [],
         clocks: ['clk'],
+        generate: [],
     };
 }
 
@@ -75,6 +76,13 @@ function inst(id: string): DataFlow['instances'][number] {
                 clock_domain: null,
                 is_cdc: false,
             },
+            {
+                name: 'ghost',
+                kind: 'unresolved',
+                endpoints: [ep('u_dst', 'LOST', 'in')],
+                clock_domain: null,
+                is_cdc: false,
+            },
         ],
     };
 
@@ -87,7 +95,12 @@ function inst(id: string): DataFlow['instances'][number] {
     const tie = [...grouped.pins.values()].find((p) => p.members.includes('TIE'));
     assert.strictEqual(tie?.side, 'W', 'an input with no driver stays an input');
     assert.strictEqual(tie?.bus, false);
-    assert.strictEqual(tie?.dangling, true);
+    assert.strictEqual(tie?.tie, '<expr>', 'an opaque actual is a tie-off, not a net');
+    assert.strictEqual(tie?.nets.length, 0);
+    assert.strictEqual(tie?.dangling, false);
+    const lost = [...grouped.pins.values()].find((p) => p.members.includes('LOST'));
+    assert.strictEqual(lost?.unresolved, 'ghost');
+    assert.strictEqual(lost?.nets.length, 0);
 
     const group = grouped.pins.get(bus.src)?.group as string;
     const expanded = buildSchematic(df, { processes: true, buses: true, minBus: 3, ungrouped: new Set([group]) });
@@ -96,6 +109,35 @@ function inst(id: string): DataFlow['instances'][number] {
 
     const flat = buildSchematic(df, { processes: true, buses: false, minBus: 3, ungrouped: new Set() });
     assert.strictEqual(flat.wires.length, 4);
+}
+
+// ---- Sub-element endpoints share the base net ------------------------------
+
+{
+    const part = (cell: string, port: string, direction: DfEndpoint['direction'], p: string): DfEndpoint => ({ ...ep(cell, port, direction), part: p });
+    const df: DataFlow = {
+        entity_path: 'lib.top',
+        architecture: 'rtl',
+        entity_pos: null,
+        external_ports: [],
+        instances: [inst('u_a'), inst('u_b')],
+        processes: [],
+        nets: [
+            {
+                name: 'credits',
+                kind: 'signal',
+                endpoints: [part('u_a', 'credits', 'out', '(i * 24 + 23 downto i * 24)'), part('u_b', 'up_credits', 'in', '(23 downto 0)')],
+                clock_domain: null,
+                is_cdc: false,
+            },
+        ],
+    };
+    const s = buildSchematic(df, { processes: true, buses: true, minBus: 3, ungrouped: new Set() });
+    assert.strictEqual(s.wires.length, 1);
+    const dst = s.pins.get(s.wires[0].dst);
+    assert.strictEqual(dst?.parts['credits'], '(23 downto 0)');
+    assert.strictEqual(dst?.dangling, false);
+    assert.strictEqual(generateTag([{ kind: 'for', label: 'G', index: 'i', range: '0 to N - 1' }, { kind: 'if', label: null, condition: null }]), 'x 0 to N - 1 / else');
 }
 
 console.log('schematic checks passed');

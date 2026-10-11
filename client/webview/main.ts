@@ -11,6 +11,7 @@ import {
     buildSchematic,
     DataFlow,
     esc,
+    GenerateScope,
     Layout,
     Measure,
     Pin,
@@ -541,9 +542,9 @@ function hideTip(): void {
     tip.hidden = true;
 }
 
-function netLine(key: string): string {
+function netLine(key: string, part = ''): string {
     const n = sch?.nets.get(key);
-    let s = esc(netName(key));
+    let s = esc(netName(key) + part);
     if (n?.clock_domain) {
         s += ' <em>@' + esc(n.clock_domain) + '</em>';
     }
@@ -553,8 +554,8 @@ function netLine(key: string): string {
     return s;
 }
 
-function netList(nets: string[]): string {
-    const shown = nets.slice(0, 12).map(netLine);
+function netList(nets: string[], parts: Record<string, string> = {}): string {
+    const shown = nets.slice(0, 12).map((n) => netLine(n, parts[n] ?? ''));
     if (nets.length > 12) {
         shown.push('<em>+' + (nets.length - 12) + ' more</em>');
     }
@@ -580,7 +581,9 @@ function tipHtml(t: Target): string {
             const head = '<b>' + esc(p.label) + '</b> ' + (p.side === 'W' ? 'in' : 'out') + (p.type ? ' : ' + esc(p.type) : '');
             const members = p.bus ? '<div class="members">' + p.members.map(esc).join(' ') + '</div>' : '';
             const nc = p.dangling ? '<div class="dim">no other endpoint of this net is modelled here</div>' : '';
-            return head + members + (p.nets.length ? '<hr>' + netList(p.nets) : '<div class="dim">unconnected</div>') + nc;
+            const tie = p.tie !== null ? '<div>tied to <b>' + esc(p.tie) + '</b></div>' : '';
+            const bad = p.unresolved !== null ? '<div class="warn">' + esc(p.unresolved) + ' did not resolve to a signal</div>' : '';
+            return head + members + (p.nets.length ? '<hr>' + netList(p.nets, p.parts) : tie || bad || '<div class="dim">unconnected</div>') + nc;
         }
         case 'wire': {
             const w = sch.wires.find((x) => x.id === t.id);
@@ -593,10 +596,23 @@ function tipHtml(t: Target): string {
                 return '';
             }
             const hint = t.kind === 'drill' ? 'click: open data flow of ' + esc(c.drill ?? '') : 'double-click: go to source';
-            return '<b>' + esc(c.title) + '</b> ' + esc(c.subtitle) + '<div class="dim">' + hint + '</div>';
+            const gen = c.generate.map((g) => '<div>' + esc(generateLine(g)) + '</div>').join('');
+            return '<b>' + esc(c.title) + '</b> ' + esc(c.subtitle) + gen + '<div class="dim">' + hint + '</div>';
         }
         default:
             return '';
+    }
+}
+
+function generateLine(g: GenerateScope): string {
+    const label = g.label ? g.label + ': ' : '';
+    switch (g.kind) {
+        case 'for':
+            return label + 'for ' + g.index + ' in ' + g.range + ' generate (one cell drawn per iteration range)';
+        case 'if':
+            return label + (g.condition === null ? 'else generate' : 'if ' + g.condition + ' generate');
+        default:
+            return label + 'case ' + g.expression + ' generate, when ' + g.choices;
     }
 }
 

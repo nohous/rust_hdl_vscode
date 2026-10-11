@@ -36,12 +36,20 @@ export interface DfInstance {
     entity_pos: SrcRange | null;
     ports: DfPort[];
     clocks: string[];
+    generate: GenerateScope[];
 }
+
+export type GenerateScope =
+    | { kind: 'for'; label: string | null; index: string; range: string }
+    | { kind: 'if'; label: string | null; condition: string | null }
+    | { kind: 'case'; label: string | null; expression: string; choices: string };
 
 export interface DfEndpoint {
     kind: 'external' | 'instance' | 'process';
     cell_id: string | null;
     port: string;
+    /** Sub-element of the net at this endpoint, as written: (7 downto 0), .field. */
+    part: string | null;
     direction: Dir;
     source_pos: SrcRange | null;
 }
@@ -56,7 +64,7 @@ export interface DfProcess {
 
 export interface DfNet {
     name: string;
-    kind: 'signal' | 'parent_port' | 'opaque';
+    kind: 'signal' | 'parent_port' | 'opaque' | 'unresolved';
     endpoints: DfEndpoint[];
     clock_domain: string | null;
     is_cdc: boolean;
@@ -98,6 +106,12 @@ export interface Pin {
     clock: boolean;
     /** Every net on the pin has this pin as its only endpoint. */
     dangling: boolean;
+    /** Sub-element text per net key, for nets the pin touches only in part. */
+    parts: Record<string, string>;
+    /** Expression the pin is tied to in the port map, null when it is on a signal. */
+    tie: string | null;
+    /** Name in the port map the analyzer could not resolve, null otherwise. */
+    unresolved: string | null;
     type: string;
     assoc: SrcRange | null;
     decl: SrcRange | null;
@@ -108,6 +122,7 @@ export interface Cell {
     kind: CellKind;
     title: string;
     subtitle: string;
+    generate: GenerateScope[];
     /** library.entity to open when descending into the cell, null when not resolvable. */
     drill: string | null;
     pos: SrcRange | null;
@@ -145,6 +160,9 @@ interface RawPin {
     side: Side;
     port: string;
     nets: string[];
+    parts: Record<string, string>;
+    tie: string | null;
+    unresolved: string | null;
     type: string;
     assoc: SrcRange | null;
     decl: SrcRange | null;
@@ -300,24 +318,38 @@ function collectRawPins(df: DataFlow, ids: string[], opts: BuildOptions): Map<st
     }
 
     const raw = new Map<string, RawPin>();
-    const add = (cell: string, side: Side, port: string, net: string, assoc: SrcRange | null): void => {
-        const key = cell + '|' + side + '|' + port.toLowerCase();
-        let pin = raw.get(key);
+    const add = (cell: string, side: Side, ep: DfEndpoint, net: DfNet, key: string): void => {
+        const k = cell + '|' + side + '|' + ep.port.toLowerCase();
+        let pin = raw.get(k);
         if (!pin) {
-            const d = decl.get((cell.startsWith('x:') ? 'x' : cell) + '|' + port.toLowerCase());
+            const d = decl.get((cell.startsWith('x:') ? 'x' : cell) + '|' + ep.port.toLowerCase());
             pin = {
                 cell,
                 side,
-                port,
+                port: ep.port,
                 nets: [],
+                parts: {},
+                tie: null,
+                unresolved: null,
                 type: d?.type_repr ?? '',
-                assoc,
+                assoc: ep.source_pos,
                 decl: d?.decl_pos ?? null,
             };
-            raw.set(key, pin);
+            raw.set(k, pin);
         }
-        if (!pin.nets.includes(net)) {
-            pin.nets.push(net);
+        if (net.kind === 'opaque') {
+            pin.tie = net.name;
+            return;
+        }
+        if (net.kind === 'unresolved') {
+            pin.unresolved = net.name;
+            return;
+        }
+        if (!pin.nets.includes(key)) {
+            pin.nets.push(key);
+        }
+        if (ep.part !== null) {
+            pin.parts[key] = ep.part;
         }
     };
 
@@ -327,7 +359,7 @@ function collectRawPins(df: DataFlow, ids: string[], opts: BuildOptions): Map<st
             if (ep.kind === 'process' && !opts.processes) {
                 return;
             }
-            add(endpointCell(ep), endpointSide(ep, i === drv), ep.port, ids[n], ep.source_pos);
+            add(endpointCell(ep), endpointSide(ep, i === drv), ep, net, ids[n]);
         });
     });
 
@@ -336,7 +368,7 @@ function collectRawPins(df: DataFlow, ids: string[], opts: BuildOptions): Map<st
 
 /**
  * @brief Keys of the nets used as clocks or resets somewhere in the architecture.
- * Opaque nets are never clocks or resets, whatever their name.
+ * Only signal and parent-port nets can be clocks or resets.
  */
 function clockAndResetNets(df: DataFlow, ids: string[]): { clocks: Set<string>; resets: Set<string> } {
     const clockNames = new Set<string>(df.instances.flatMap((i) => i.clocks));
@@ -353,10 +385,11 @@ function clockAndResetNets(df: DataFlow, ids: string[]): { clocks: Set<string>; 
     const clocks = new Set<string>();
     const resets = new Set<string>();
     df.nets.forEach((n, i) => {
-        if (n.kind !== 'opaque' && clockNames.has(n.name)) {
+        const carried = n.kind === 'signal' || n.kind === 'parent_port';
+        if (carried && clockNames.has(n.name)) {
             clocks.add(ids[i]);
         }
-        if (n.kind !== 'opaque' && resetNames.has(n.name)) {
+        if (carried && resetNames.has(n.name)) {
             resets.add(ids[i]);
         }
     });
@@ -419,6 +452,9 @@ export function buildSchematic(df: DataFlow, opts: BuildOptions): Schematic {
                 bus: collapsed,
                 clock: r.nets.some((n) => clocks.has(n)),
                 dangling: false,
+                parts: Object.assign({}, ...ms.map((m) => m.parts)),
+                tie: collapsed ? null : r.tie,
+                unresolved: collapsed ? null : r.unresolved,
                 type: collapsed ? ms.length + ' ports' : r.type,
                 assoc: collapsed ? null : r.assoc,
                 decl: collapsed ? null : r.decl,
@@ -436,7 +472,7 @@ export function buildSchematic(df: DataFlow, opts: BuildOptions): Schematic {
         const id = ids[n];
         nets.set(id, net);
         const eps = net.endpoints.filter((e) => opts.processes || e.kind !== 'process');
-        if (eps.length === 0) {
+        if (eps.length === 0 || (net.kind !== 'signal' && net.kind !== 'parent_port')) {
             return;
         }
         const drvEp = net.endpoints[driverIndex(net)];
@@ -482,6 +518,7 @@ function buildCells(df: DataFlow, opts: BuildOptions, pins: Map<string, Pin>): C
             kind: 'instance',
             title: inst.label ?? inst.id,
             subtitle: resolved ? inst.entity_path : inst.component ? 'component ' + inst.component : 'unresolved',
+            generate: inst.generate,
             drill: resolved ? inst.entity_path : null,
             pos: inst.instance_pos,
             entityPos: inst.entity_pos,
@@ -494,6 +531,7 @@ function buildCells(df: DataFlow, opts: BuildOptions, pins: Map<string, Pin>): C
                 id: 'p:' + proc.id,
                 kind: 'process',
                 title: proc.label ?? 'process :' + ((proc.source_pos?.start.line ?? -1) + 1),
+                generate: [],
                 subtitle: proc.clock_signal ? 'process @ ' + proc.clock_signal : 'process (comb)',
                 drill: null,
                 pos: proc.source_pos,
@@ -514,6 +552,7 @@ function buildCells(df: DataFlow, opts: BuildOptions, pins: Map<string, Pin>): C
                 kind: ext === EXT_IN ? 'input' : 'output',
                 title: pin.label,
                 subtitle: '',
+                generate: [],
                 drill: null,
                 pos: d?.decl_pos ?? null,
                 entityPos: null,
@@ -553,6 +592,24 @@ export interface Layout {
     wires: Map<string, { d: string; junctions: { x: number; y: number }[] }>;
 }
 
+/**
+ * @brief Short header tag for the generate scopes of a cell: "x 0 to N - 1 / if COND".
+ */
+export function generateTag(scopes: GenerateScope[]): string {
+    return scopes
+        .map((g) => {
+            switch (g.kind) {
+                case 'for':
+                    return 'x ' + g.range;
+                case 'if':
+                    return g.condition === null ? 'else' : 'if ' + g.condition;
+                default:
+                    return 'case ' + g.choices;
+            }
+        })
+        .join(' / ');
+}
+
 function pinText(p: Pin): string {
     return p.bus ? p.label + ' [' + p.members.length + ']' : p.label;
 }
@@ -588,7 +645,8 @@ export function toElk(s: Schematic, measure: Measure): ElkNode {
         const w = (side: Side): number =>
             Math.max(0, ...c.pins.filter((p) => p.side === side).map((p) => measure(pinText(p), false)));
         const inner = w('W') + w('E') + 28;
-        const head = Math.max(measure(c.title, true), measure(c.subtitle, false)) + 36;
+        const tag = generateTag(c.generate);
+        const head = Math.max(measure(c.title, true), measure(c.subtitle, false) + (tag ? measure(tag, false) + 28 : 0)) + 36;
         const rows = Math.max(1, ...(['W', 'E'] as Side[]).map((sd) => c.pins.filter((p) => p.side === sd).length));
         return {
             id: c.id,
@@ -672,7 +730,8 @@ export function esc(s: string): string {
 }
 
 function renderPin(p: Pin, at: { x: number; y: number }, cell: Placed, isPort: boolean): string {
-    const cls = ['pin', p.bus ? 'bus' : '', p.clock ? 'clock' : '', p.dangling ? 'nc' : '']
+    const loose = p.nets.length === 0;
+    const cls = ['pin', p.bus ? 'bus' : '', p.clock ? 'clock' : '', p.dangling || (loose && p.unresolved !== null) ? 'nc' : '', loose && p.tie !== null ? 'tie' : '']
         .filter(Boolean)
         .join(' ');
     const out: string[] = ['<g class="' + cls + '" data-p="' + esc(p.id) + '">'];
@@ -681,8 +740,11 @@ function renderPin(p: Pin, at: { x: number; y: number }, cell: Placed, isPort: b
     const y = at.y;
     out.push('<rect class="pinhit" x="' + (west ? x - 6 : cell.x + cell.width / 2) + '" y="' + (y - PIN_PITCH / 2) +
         '" width="' + (cell.width / 2 + 6) + '" height="' + PIN_PITCH + '"/>');
-    if (p.dangling) {
+    if (p.dangling || (loose && p.unresolved !== null)) {
         out.push('<circle class="ncmark" cx="' + (west ? x - 4 : x + 4) + '" cy="' + y + '" r="2.5"/>');
+    } else if (loose && p.tie !== null) {
+        const d = west ? -1 : 1;
+        out.push('<path class="tiemark" d="M' + x + ' ' + y + 'h' + 5 * d + 'M' + (x + 5 * d) + ' ' + (y - 4) + 'v8"/>');
     }
     if (p.clock && !isPort) {
         const d = west ? 1 : -1;
@@ -717,6 +779,10 @@ function renderCell(c: Cell, at: Placed, lay: Layout): string {
         out.push('<line class="headsep" x1="' + at.x + '" y1="' + (at.y + HEADER - 6) + '" x2="' + (at.x + at.width) + '" y2="' + (at.y + HEADER - 6) + '"/>');
         out.push('<text class="title" x="' + (at.x + 8) + '" y="' + (at.y + 14) + '">' + esc(c.title) + '</text>');
         out.push('<text class="subtitle' + (c.kind === 'instance' && c.entityPos === null ? ' unresolved' : '') + '" x="' + (at.x + 8) + '" y="' + (at.y + 26) + '">' + esc(c.subtitle) + '</text>');
+        const tag = generateTag(c.generate);
+        if (tag) {
+            out.push('<text class="gentag" x="' + (at.x + at.width - (c.drill !== null ? 24 : 8)) + '" y="' + (at.y + 26) + '" text-anchor="end">' + esc(tag) + '</text>');
+        }
         if (c.drill !== null) {
             const bx = at.x + at.width - 20;
             const by = at.y + 5;

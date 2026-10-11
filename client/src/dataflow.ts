@@ -295,6 +295,8 @@ header input { font: inherit; background: var(--vscode-input-background); color:
 .title { fill: var(--fg); font-weight: bold; }
 .subtitle { fill: var(--dim); font-size: 10px; }
 .subtitle.unresolved { fill: var(--warn); }
+.gentag { fill: var(--c3); font-size: 10px; }
+.tiemark { fill: none; stroke: var(--dim); stroke-width: 1; }
 .portlabel, .pinlabel { fill: var(--fg); }
 .pin.bus .pinlabel, .portlabel { font-weight: bold; }
 .buswidth { fill: var(--dim); font-weight: normal; }
