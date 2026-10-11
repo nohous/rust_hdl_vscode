@@ -21,6 +21,7 @@ function inst(id: string): DataFlow['instances'][number] {
         ports: [],
         clocks: ['clk'],
         generate: [],
+        generics: [],
     };
 }
 
@@ -54,6 +55,7 @@ function inst(id: string): DataFlow['instances'][number] {
         external_ports: [],
         instances: [inst('u_src'), inst('u_dst')],
         processes: [],
+        generics: [],
         nets: [
             ...['a', 'b', 'c'].map((n) => ({
                 name: 'n_' + n,
@@ -122,6 +124,7 @@ function inst(id: string): DataFlow['instances'][number] {
         external_ports: [],
         instances: [inst('u_a'), inst('u_b')],
         processes: [],
+        generics: [],
         nets: [
             {
                 name: 'credits',
@@ -137,7 +140,8 @@ function inst(id: string): DataFlow['instances'][number] {
     const dst = s.pins.get(s.wires[0].dst);
     assert.strictEqual(dst?.parts['credits'], '(23 downto 0)');
     assert.strictEqual(dst?.dangling, false);
-    assert.strictEqual(generateTag([{ kind: 'for', label: 'G', index: 'i', range: '0 to N - 1' }, { kind: 'if', label: null, condition: null }]), 'x 0 to N - 1 / else');
+    assert.strictEqual(generateTag([{ kind: 'for', label: 'G', index: 'i', range: '0 to N - 1', value: null }, { kind: 'if', label: null, condition: null, taken: false }]), 'x 0 to N - 1 / else');
+    assert.strictEqual(generateTag([{ kind: 'for', label: 'G', index: 'i', range: '0 to 3', value: 2 }, { kind: 'if', label: null, condition: 'FAST', taken: true }]), '');
 }
 
 console.log('schematic checks passed');

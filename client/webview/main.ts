@@ -12,6 +12,7 @@ import {
     DataFlow,
     esc,
     GenerateScope,
+    GenericValue,
     Layout,
     Measure,
     Pin,
@@ -597,7 +598,8 @@ function tipHtml(t: Target): string {
             }
             const hint = t.kind === 'drill' ? 'click: open data flow of ' + esc(c.drill ?? '') : 'double-click: go to source';
             const gen = c.generate.map((g) => '<div>' + esc(generateLine(g)) + '</div>').join('');
-            return '<b>' + esc(c.title) + '</b> ' + esc(c.subtitle) + gen + '<div class="dim">' + hint + '</div>';
+            const inst = df?.instances.find((i) => 'i:' + i.id === c.id);
+            return '<b>' + esc(c.title) + '</b> ' + esc(c.subtitle) + genericLines(inst?.generics ?? []) + gen + '<div class="dim">' + hint + '</div>';
         }
         default:
             return '';
@@ -608,12 +610,21 @@ function generateLine(g: GenerateScope): string {
     const label = g.label ? g.label + ': ' : '';
     switch (g.kind) {
         case 'for':
-            return label + 'for ' + g.index + ' in ' + g.range + ' generate (one cell drawn per iteration range)';
+            return g.value === null
+                ? label + 'for ' + g.index + ' in ' + g.range + ' generate (range not static; one cell stands for all iterations)'
+                : label + 'for ' + g.index + ' in ' + g.range + ' generate, ' + g.index + ' = ' + g.value;
         case 'if':
-            return label + (g.condition === null ? 'else generate' : 'if ' + g.condition + ' generate');
+            return label + (g.condition === null ? 'else generate' : 'if ' + g.condition + ' generate') + (g.taken ? '' : ' (condition not static)');
         default:
-            return label + 'case ' + g.expression + ' generate, when ' + g.choices;
+            return label + 'case ' + g.expression + ' generate, when ' + g.choices + (g.taken ? '' : ' (selector not static)');
     }
+}
+
+function genericLines(generics: GenericValue[]): string {
+    if (generics.length === 0) {
+        return '';
+    }
+    return '<div class="members">generic map: ' + generics.map((g) => esc(g.name) + ' = ' + (g.value === null ? '?' : esc(String(g.value)))).join(', ') + '</div>';
 }
 
 function targetKey(t: Target): string {

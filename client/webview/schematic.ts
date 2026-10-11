@@ -37,12 +37,20 @@ export interface DfInstance {
     ports: DfPort[];
     clocks: string[];
     generate: GenerateScope[];
+    generics: GenericValue[];
 }
 
 export type GenerateScope =
-    | { kind: 'for'; label: string | null; index: string; range: string }
-    | { kind: 'if'; label: string | null; condition: string | null }
-    | { kind: 'case'; label: string | null; expression: string; choices: string };
+    | { kind: 'for'; label: string | null; index: string; range: string; value: number | null }
+    | { kind: 'if'; label: string | null; condition: string | null; taken: boolean }
+    | { kind: 'case'; label: string | null; expression: string; choices: string; taken: boolean };
+
+export type StaticValue = number | boolean | string;
+
+export interface GenericValue {
+    name: string;
+    value: StaticValue | null;
+}
 
 export interface DfEndpoint {
     kind: 'external' | 'instance' | 'process';
@@ -60,6 +68,7 @@ export interface DfProcess {
     source_pos: SrcRange | null;
     clock_signal: string | null;
     reset_signal: string | null;
+    generate: GenerateScope[];
 }
 
 export interface DfNet {
@@ -78,6 +87,7 @@ export interface DataFlow {
     instances: DfInstance[];
     processes: DfProcess[];
     nets: DfNet[];
+    generics: GenericValue[];
 }
 
 // ----------------------------------------------------------------------------
@@ -531,7 +541,7 @@ function buildCells(df: DataFlow, opts: BuildOptions, pins: Map<string, Pin>): C
                 id: 'p:' + proc.id,
                 kind: 'process',
                 title: proc.label ?? 'process :' + ((proc.source_pos?.start.line ?? -1) + 1),
-                generate: [],
+                generate: proc.generate,
                 subtitle: proc.clock_signal ? 'process @ ' + proc.clock_signal : 'process (comb)',
                 drill: null,
                 pos: proc.source_pos,
@@ -593,20 +603,23 @@ export interface Layout {
 }
 
 /**
- * @brief Short header tag for the generate scopes of a cell: "x 0 to N - 1 / if COND".
+ * @brief Short header tag for the generate scopes a cell was not elaborated
+ * through: "x 0 to N - 1 / if COND". Elaborated scopes leave no tag; the
+ * iteration index is already in the cell title.
  */
 export function generateTag(scopes: GenerateScope[]): string {
     return scopes
         .map((g) => {
             switch (g.kind) {
                 case 'for':
-                    return 'x ' + g.range;
+                    return g.value === null ? 'x ' + g.range : '';
                 case 'if':
-                    return g.condition === null ? 'else' : 'if ' + g.condition;
+                    return g.taken ? '' : g.condition === null ? 'else' : 'if ' + g.condition;
                 default:
-                    return 'case ' + g.choices;
+                    return g.taken ? '' : 'case ' + g.choices;
             }
         })
+        .filter(Boolean)
         .join(' / ');
 }
 
